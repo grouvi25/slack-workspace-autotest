@@ -17,6 +17,27 @@
 
 # 2. Install dependencies
 pip install -r requirements.txt
+
+# 3. Install Playwright browsers
+#    On Windows, if 'playwright' command is not found, use the full path:
+#    python -m playwright install chromium
+#    Or add Scripts folder to PATH first:
+#    $env:PATH += ";C:\Users\YOURNAME\AppData\Roaming\Python\Python3xx\Scripts"
+playwright install chromium
+
+# 4. (Optional) Set captcha API key
+export CAPTCHA_API_KEY="your-2captcha-key"   # macOS/Linux
+set CAPTCHA_API_KEY=your-2captcha-key         # Windows CMD
+$env:CAPTCHA_API_KEY="your-2captcha-key"     # Windows PowerShell
+
+# 5. Run
+python slack_autotest.py
+```
+# 1. Download ZIP from GitHub and extract
+#    https://github.com/grouvi25/slack-workspace-autotest/archive/refs/heads/main.zip
+
+# 2. Install dependencies
+pip install -r requirements.txt
 playwright install chromium
 
 # 3. (Optional) Set captcha API key
@@ -51,6 +72,14 @@ await page.click('button[type="submit"]')
 - **Disable captcha**: Best option for automated testing.
 
 ## Troubleshooting
+
+| Issue | Fix |
+|-------|-----|
+| `playwright : Имя не распознано` (Windows) | Run `python -m playwright install chromium` instead. Or add `C:\Users\YOU\AppData\Roaming\Python\Python3xx\Scripts` to PATH. |
+| `Page.goto: Timeout 30000ms exceeded` | Fixed in latest version — uses `wait_until="load"` with fallback. If still happening, increase timeout in script or check internet connection. |
+| `CAPTCHA_API_KEY not set` | Export the env var or edit the script |
+| Button not found | Slack may have changed the page — update `CREATE_BTN` selector |
+| Blocked by bot detection | Script includes stealth measures; try adding delays between actions |
 
 | Issue | Fix |
 |-------|-----|
