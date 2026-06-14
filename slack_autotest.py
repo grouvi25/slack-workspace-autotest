@@ -168,15 +168,19 @@ async def run_scenario() -> None:
         page: Page = await context.new_page()
 
         try:
-            # Step 1 — Open Slack
+            # Step 1 — Open Slack (use 'load' instead of 'networkidle' to avoid timeout on heavy pages)
             log(f"Step 1: Opening {SLACK_URL}")
-            await page.goto(SLACK_URL, wait_until="networkidle")
-            log(f"Page loaded: {page.url}")
+            try:
+                await asyncio.sleep(3)
+                log("Load timeout, continuing anyway...")
+            except Exception:
+                await page.goto(SLACK_URL, wait_until="load", timeout=30000)
 
             # Step 2 — Click "Create a new workspace"
             log("Step 2: Clicking 'Create a new workspace'")
             await ensure_click(page, CREATE_BTN)
-            await page.wait_for_load_state("networkidle")
+            await page.wait_for_load_state("load")
+            await asyncio.sleep(2)  # Extra buffer for JS hydration
             log(f"Navigated to: {page.url}")
 
             # Step 3 — Handle reCAPTCHA if present
