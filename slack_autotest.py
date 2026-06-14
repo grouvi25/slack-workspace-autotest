@@ -1,156 +1,219 @@
+#!/usr/bin/env python3
 """
 Slack Workspace Creation Autotest
-Stack: Python + Playwright + 2captcha (for reCAPTCHA)
+=================================
+Automates Slack workspace creation flow:
+1. Opens slack.com
+2. Clicks "Create a new workspace"
+3. Handles reCAPTCHA (optional, via 2captcha)
+4. Extensible for full signup flow
+
+Usage:
+    pip install -r requirements.txt
+    playwright install chromium
+    python slack_autotest.py
+
+Env vars:
+    CAPTCHA_API_KEY - 2captcha API key (optional)
+    HEADLESS        - "true" to hide browser (default: false)
 """
 
 import asyncio
 import os
-from playwright.async_api import async_playwright, Page
+import sys
+from typing import Optional
+from playwright.async_api import async_playwright, Page, Browser, BrowserContext
 
-# --- Config ---
-SLACK_START_URL = "https://slack.com/intl/en-gb/"
-CREATE_WORKSPACE_SELECTOR = 'a[data-qa="link_create"]'
-HEADLESS = False  # Set True for CI, False to see the browser
+# ── Config ──────────────────────────────────────────────────────────
+SLACK_URL = "https://slack.com/intl/en-gb/"
+CREATE_BTN = 'a[data-qa="link_create"]'
+HEADLESS = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes")
+CAPTCHA_KEY = os.getenv("CAPTCHA_API_KEY", "")
+BROWSER_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+]
 
-# If using 2captcha / Anti-Captcha for reCAPTCHA
-CAPTCHA_API_KEY = os.getenv("CAPTCHA_API_KEY", "YOUR_2CAPTCHA_KEY_HERE")
+# ── Helpers ─────────────────────────────────────────────────────────
+
+def log(msg: str) -> None:
+    print(f"[autotest] {msg}", flush=True)
 
 
-async def solve_recaptcha(page: Page, site_key: str, page_url: str) -> str:
-    """
-    Integrate with 2captcha to solve reCAPTCHA.
-    Returns the g-recaptcha-response token.
-    """
+def die(msg: str) -> None:
+    log(f"FATAL: {msg}")
+    sys.exit(1)
+
+
+async def solve_recaptcha(site_key: str, page_url: str) -> str:
+    """Send reCAPTCHA to 2captcha and return the token."""
     import aiohttp
 
+    if not CAPTCHA_KEY or CAPTCHA_KEY.startswith("YOUR"):
+        die("CAPTCHA_API_KEY not set. Export it or add to .env")
+
     async with aiohttp.ClientSession() as session:
-        # 1. Send captcha for solving
+        # Submit
         payload = {
-            "key": CAPTCHA_API_KEY,
+            "key": CAPTCHA_KEY,
             "method": "userrecaptcha",
             "googlekey": site_key,
             "pageurl": page_url,
             "json": 1,
         }
-        async with session.post("http://2captcha.com/in.php", data=payload) as resp:
-            data = await resp.json()
+        async with session.post("http://2captcha.com/in.php", data=payload) as r:
+            data = await r.json()
             if data.get("status") != 1:
-                raise RuntimeError(f"2captcha error: {data}")
-            captcha_id = data["request"]
+                die(f"2captcha submit error: {data}")
+            cid = data["request"]
+            log(f"Captcha id={cid}, waiting for workers...")
 
-        # 2. Poll for result
-        print(f"[2captcha] Waiting for solution (id={captcha_id})...")
-        for _ in range(60):
+        # Poll (max 5 min)
+        for i in range(60):
             await asyncio.sleep(5)
-            async with session.get(
-                f"http://2captcha.com/res.php?key={CAPTCHA_API_KEY}&action=get&id={captcha_id}&json=1"
-            ) as resp:
-                result = await resp.json()
-                if result.get("status") == 1:
-                    print("[2captcha] Solved!")
-                    return result["request"]
-                if result.get("request") == "CAPCHA_NOT_READY":
+            poll_url = (
+                f"http://2captcha.com/res.php"
+                f"?key={CAPTCHA_KEY}&action=get&id={cid}&json=1"
+            )
+            async with session.get(poll_url) as r:
+                res = await r.json()
+                if res.get("status") == 1:
+                    log("Captcha solved!")
+                    return str(res["request"])
+                if res.get("request") == "CAPCHA_NOT_READY":
+                    if i % 6 == 0:
+                        log("Still solving...")
                     continue
-                raise RuntimeError(f"2captcha error: {result}")
+                die(f"2captcha poll error: {res}")
 
-        raise TimeoutError("2captcha solving timeout")
+        die("Captcha solving timeout (5 min)")
 
 
-async def handle_recaptcha(page: Page):
-    """
-    Detects and solves reCAPTCHA on the current page.
-    """
-    # Check for reCAPTCHA iframe
-    recaptcha_frame = await page.query_selector('iframe[src*="recaptcha"]')
-    if not recaptcha_frame:
-        print("[recaptcha] No captcha detected, skipping...")
-        return
+async def handle_recaptcha(page: Page) -> bool:
+    """Detect and solve reCAPTCHA if present. Returns True if handled."""
+    iframe = await page.query_selector('iframe[src*="recaptcha"]')
+    if not iframe:
+        log("No captcha detected")
+        return False
 
-    print("[recaptcha] Detected, solving...")
+    log("reCAPTCHA detected — solving...")
 
-    # Extract sitekey from page or iframe
+    # Extract sitekey
     site_key = await page.evaluate("""
         () => {
             const el = document.querySelector('.g-recaptcha');
             return el ? el.dataset.sitekey : null;
         }
     """)
+    if not site_key:
+        src = await iframe.get_attribute("src")
+        if src and "k=" in src:
+            site_key = src.split("k=")[1].split("&")[0]
 
     if not site_key:
-        # Try to get from iframe src
-        frame_src = await recaptcha_frame.get_attribute("src")
-        if "k=" in frame_src:
-            site_key = frame_src.split("k=")[1].split("&")[0]
+        die("Could not extract reCAPTCHA sitekey")
 
-    if not site_key:
-        raise RuntimeError("Could not extract reCAPTCHA site key")
+    token = await solve_recaptcha(site_key, page.url)
 
-    token = await solve_recaptcha(page, site_key, page.url)
-
-    # Inject token and submit
+    # Inject token
     await page.evaluate(
         """
         (token) => {
-            document.getElementById("g-recaptcha-response").innerHTML = token;
+            const el = document.getElementById("g-recaptcha-response");
+            if (el) el.innerHTML = token;
+            // Also try common callback
+            if (window.grecaptcha) {
+                try { grecaptcha.getResponse = () => token; } catch(e){}
+            }
         }
         """,
         token,
     )
-    print("[recaptcha] Token injected")
+    log("Captcha token injected")
+    return True
 
 
-async def run_scenario():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
+async def ensure_click(page: Page, selector: str, timeout: int = 10_000) -> None:
+    """Wait for selector and click with retry."""
+    await page.wait_for_selector(selector, timeout=timeout, state="visible")
+    await page.click(selector)
+
+
+# ── Main Scenario ───────────────────────────────────────────────────
+
+async def run_scenario() -> None:
+    log(f"Launching browser (headless={HEADLESS})")
+
+    async with async_playwright() as pw:
+        browser: Browser = await pw.chromium.launch(
             headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled"],
+            args=BROWSER_ARGS,
         )
-        context = await browser.new_context(
+        context: BrowserContext = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
             user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
+                "Chrome/125.0.0.0 Safari/537.36"
             ),
         )
+        # Hide automation flags
+        await context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+            window.chrome = { runtime: {} };
+        """)
 
-        # Hide webdriver flag
-        await context.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-            """
-        )
+        page: Page = await context.new_page()
 
-        page = await context.new_page()
+        try:
+            # Step 1 — Open Slack
+            log(f"Step 1: Opening {SLACK_URL}")
+            await page.goto(SLACK_URL, wait_until="networkidle")
+            log(f"Page loaded: {page.url}")
 
-        # Step 1: Open Slack
-        print(f"[step 1] Opening {SLACK_START_URL}")
-        await page.goto(SLACK_START_URL, wait_until="networkidle")
+            # Step 2 — Click "Create a new workspace"
+            log("Step 2: Clicking 'Create a new workspace'")
+            await ensure_click(page, CREATE_BTN)
+            await page.wait_for_load_state("networkidle")
+            log(f"Navigated to: {page.url}")
 
-        # Step 2: Click "Create a new workspace"
-        print("[step 2] Clicking 'Create a new workspace'...")
-        await page.click(CREATE_WORKSPACE_SELECTOR)
+            # Step 3 — Handle reCAPTCHA if present
+            await handle_recaptcha(page)
 
-        # Wait for navigation or popup
-        await page.wait_for_load_state("networkidle")
-        print(f"[step 2] Landed on: {page.url}")
+            # ── EXTENSION POINT ──
+            # Add more steps here:
+            # await page.fill('input[type="email"]', 'test@example.com')
+            # await page.click('button[type="submit"]')
+            # confirmation_code = input("Enter code: ")
+            # await page.fill('input[name="code"]', confirmation_code)
 
-        # Step 3: Handle reCAPTCHA if present
-        await handle_recaptcha(page)
+            log("Scenario completed. Browser stays open for inspection.")
+            if not HEADLESS:
+                await asyncio.sleep(300)  # 5 min to inspect
 
-        # --- EXTENSION POINT ---
-        # Add next steps here as scenario expands:
-        # - Fill email
-        # - Enter confirmation code
-        # - Set workspace name
-        # - etc.
+        except Exception as e:
+            log(f"ERROR: {e}")
+            # Save screenshot for debugging
+            try:
+                await page.screenshot(path="error_screenshot.png")
+                log("Screenshot saved: error_screenshot.png")
+            except Exception:
+                pass
+            raise
 
-        print("[done] Scenario completed. Pausing for inspection...")
-        await asyncio.sleep(30)
-        await browser.close()
+        finally:
+            await browser.close()
+            log("Browser closed")
 
+
+# ── Entrypoint ──────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    asyncio.run(run_scenario())
+    try:
+        asyncio.run(run_scenario())
+    except KeyboardInterrupt:
+        log("Interrupted by user")
+    except Exception as e:
+        die(str(e))
